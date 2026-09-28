@@ -1,0 +1,9 @@
+# 统一行尾：文本文件统一为 LF，避免 Windows CRLF 影响 CI 与脚本执行
+* text=auto
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.mjs  text eol=lf
+*.js   text eol=lf
+*.ts   text eol=lf
+*.md   text eol=lf
+*.json text eol=lf

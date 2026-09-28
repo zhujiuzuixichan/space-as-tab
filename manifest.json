@@ -1,0 +1,11 @@
+{
+  "id": "space-as-tab",
+  "name": "Space as Tab",
+  "version": "1.0.0",
+  "minAppVersion": "1.0.0",
+  "description": "Make typing N consecutive spaces (default 4) equivalent to pressing Tab, with a toggle in settings. 让「输入四个空格」等价于一个 Tab 缩进，可在设置中开关。",
+  "author": "Mu",
+  "authorUrl": "https://github.com/zhujiuzuixichan",
+  "fundingUrl": "https://github.com/zhujiuzuixichan",
+  "isDesktopOnly": false
+}
