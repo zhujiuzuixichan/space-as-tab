@@ -1,28 +1,17 @@
 import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { EditorView } from "@codemirror/view";
-import {
-  Annotation,
-  Compartment,
-  EditorSelection,
-  Prec,
-  Text,
-  type Extension,
-} from "@codemirror/state";
-import { indentUnit } from "@codemirror/language";
+import { Annotation, Text, type Extension } from "@codemirror/state";
 
 /**
  * 插件设置结构。
- * - keepSpacesAsSpaces：是否屏蔽 Obsidian 原生「空格等价于 Tab 缩进」的行为
- * - spacesPerTab：1 个 Tab 等价于多少个空格（默认 4）
+ * - keepSpacesAsSpaces：是否让「输入的空格」保持普通空格（不触发缩进识别）
  */
 interface KeepSpacesSettings {
   keepSpacesAsSpaces: boolean;
-  spacesPerTab: number;
 }
 
 const DEFAULT_SETTINGS: KeepSpacesSettings = {
   keepSpacesAsSpaces: true,
-  spacesPerTab: 4,
 };
 
 /** 零宽不连接符：插入在行首可打破 Markdown 的「缩进」识别，但视觉上不可见 */
@@ -33,7 +22,6 @@ const Correction = Annotation.define<boolean>();
 
 export default class KeepSpacesPlugin extends Plugin {
   settings: KeepSpacesSettings;
-  private indentCompartment = new Compartment();
 
   async onload() {
     await this.loadSettings();
@@ -43,27 +31,12 @@ export default class KeepSpacesPlugin extends Plugin {
 
   onunload() {}
 
-  /**
-   * 覆盖 Obsidian 缩进单位：useTab 开启时它是 "\t"，这里用最高优先级
-   * 把它换成空格，使缩进系统不再产生 Tab 字符。
-   */
-  private buildIndentExtension(): Extension {
-    const unit = this.settings.keepSpacesAsSpaces
-      ? " ".repeat(Math.max(1, this.settings.spacesPerTab))
-      : "\t";
-    return Prec.highest(indentUnit.of(unit));
-  }
-
   buildEditorExtension(): Extension {
     const plugin = this;
 
-    // 方案一：覆盖 indentUnit 为空格（消除 Tab 字符层面的转换）
-    const indentOverride = this.indentCompartment.of(
-      this.buildIndentExtension()
-    );
-
-    // 方案二：行首插入零宽字符（打破 Markdown 的「缩进」识别，
-    // 消除缩进参考线 / 缩进代码块等由 4 空格触发的结构化效果）
+    // 核心方案：行首插入零宽字符，打破 Markdown 对「空格缩进」的识别。
+    // 仅处理「4 个及以上空格」开头的行，不碰 Tab 缩进，因此 Tab 键的
+    // 原生缩进功能完全保留。
     const zwnjApplier = EditorView.updateListener.of((update) => {
       if (!plugin.settings.keepSpacesAsSpaces) {
         return;
@@ -98,8 +71,6 @@ export default class KeepSpacesPlugin extends Plugin {
         return;
       }
 
-      // 对受影响的行逐一检测：行首是 4+ 空格 / Tab 且不属于合法缩进场景时，
-      // 在行首插入 ZWNJ
       const doc = update.state.doc;
       const insertions: number[] = [];
       for (const lineNumber of touchedLines) {
@@ -123,7 +94,7 @@ export default class KeepSpacesPlugin extends Plugin {
       }
     });
 
-    // 方案三：事后纠正兜底——若仍有「空格被转成 Tab」的变化，立即换回空格
+    // 兜底纠正：若仍有「空格被转成 Tab 字符」的变化，立即换回空格
     const corrector = EditorView.updateListener.of((update) => {
       if (!plugin.settings.keepSpacesAsSpaces) {
         return;
@@ -144,18 +115,15 @@ export default class KeepSpacesPlugin extends Plugin {
           }
           const ins = inserted.toString();
           const del = tr.startState.doc.sliceString(fromA, toA);
+          // 判定：删除了「含空格的纯空白」，插入了「含 Tab 的纯空白」
           if (
             /^[ \t]*$/.test(del) &&
             /^[ \t]*$/.test(ins) &&
             del.includes(" ") &&
             ins.includes("\t")
           ) {
-            const tabCount = (ins.match(/\t/g) || []).length;
-            const spaceCount = (ins.match(/ /g) || []).length;
-            const spaces = " ".repeat(
-              spaceCount + tabCount * plugin.settings.spacesPerTab
-            );
-            fix = { from: fromB, to: toB, insert: spaces };
+            // 把 Tab 换回原本删除的空格（保持用户输入的空格数）
+            fix = { from: fromB, to: toB, insert: del };
           }
         });
       }
@@ -172,23 +140,7 @@ export default class KeepSpacesPlugin extends Plugin {
       }
     });
 
-    return [indentOverride, zwnjApplier, corrector];
-  }
-
-  /**
-   * 设置变化后，把新的缩进单位应用到所有已打开的编辑器。
-   */
-  refreshIndentUnit() {
-    const effect = this.indentCompartment.reconfigure(
-      this.buildIndentExtension()
-    );
-    this.app.workspace.iterateAllLeaves((leaf) => {
-      const anyView = leaf.view as { editor?: { cm?: EditorView } } | null;
-      const cm = anyView?.editor?.cm;
-      if (cm) {
-        cm.dispatch({ effects: effect });
-      }
-    });
+    return [zwnjApplier, corrector];
   }
 
   async loadSettings() {
@@ -202,8 +154,9 @@ export default class KeepSpacesPlugin extends Plugin {
 
 /**
  * 判断某行是否需要在行首插入 ZWNJ。
- * 条件：行首是 Tab 或 4+ 空格、尚未有 ZWNJ、
+ * 条件：行首是「4 个及以上空格」、尚未有 ZWNJ、
  *       且不属于「缩进合法」的场景（列表、引用、围栏代码块、YAML）。
+ * 注意：刻意不匹配 Tab，从而保留 Tab 键的原生缩进功能。
  */
 function lineNeedsZWNJ(
   doc: Text,
@@ -213,7 +166,8 @@ function lineNeedsZWNJ(
   if (lineText.startsWith(ZWNJ)) {
     return false;
   }
-  if (!/^(\t| {4})/.test(lineText)) {
+  // 只匹配空格缩进（4 个及以上），不匹配 Tab 缩进
+  if (!/^ {4}/.test(lineText)) {
     return false;
   }
   // 去掉缩进后是列表项 / 任务 / 引用 → 属于合法缩进，不处理
@@ -221,7 +175,6 @@ function lineNeedsZWNJ(
   if (/^([-*+]|\d+[.)])\s/.test(trimmed) || /^>/.test(trimmed)) {
     return false;
   }
-  // 围栏代码块 / YAML frontmatter 内不处理
   if (isInsideFencedCode(doc, lineNumber)) {
     return false;
   }
@@ -281,10 +234,10 @@ class KeepSpacesSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Keep Spaces（空格保持空格）" });
 
     new Setting(containerEl)
-      .setName("屏蔽「空格转 Tab / 缩进」")
+      .setName("屏蔽「空格缩进」识别")
       .setDesc(
-        "开启后：输入的空格保持为普通空格——不会被转成 Tab，也不会触发" +
-          "缩进参考线、缩进代码块等结构化效果。列表、代码块、引用中的缩进不受影响。"
+        "开启后，行首输入的 4 个及以上空格会保持普通空格，不触发缩进参考线、" +
+          "缩进代码块等结构化效果；Tab 键的原生缩进功能保持不变。修改后立即生效并自动保存。"
       )
       .addToggle((toggle) =>
         toggle
@@ -292,23 +245,6 @@ class KeepSpacesSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.keepSpacesAsSpaces = value;
             await this.plugin.saveSettings();
-            this.plugin.refreshIndentUnit();
-          })
-      );
-
-    new Setting(containerEl)
-      .setName("一个 Tab 对应的空格数")
-      .setDesc("缩进单位宽度（默认 4）。")
-      .addText((text) =>
-        text
-          .setValue(String(this.plugin.settings.spacesPerTab))
-          .onChange(async (value) => {
-            const parsed = parseInt(value, 10);
-            if (!Number.isNaN(parsed) && parsed >= 1) {
-              this.plugin.settings.spacesPerTab = parsed;
-              await this.plugin.saveSettings();
-              this.plugin.refreshIndentUnit();
-            }
           })
       );
   }
