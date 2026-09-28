@@ -1,8 +1,8 @@
 # Keep Spaces
 
-一个 Obsidian 插件：**屏蔽 Obsidian 原生「输入空格自动转 Tab」的行为**，让你输入 4 个空格就还是 4 个空格，不被自动转成 Tab。
+一个 Obsidian 插件：让**行首输入的 4 个及以上空格保持普通空格**，不被 Obsidian 识别成「缩进」（不会出现缩进参考线、缩进代码块等结构化效果）；同时**完全保留 Tab 键的原生缩进功能**。
 
-An Obsidian plugin that **disables Obsidian's native auto-conversion of typed spaces to Tab**, so your spaces stay spaces.
+An Obsidian plugin that keeps leading spaces (4+) as plain spaces — no indent guide, no indented code block — while **leaving the Tab key's native indentation untouched**.
 
 [English](#english) · [中文](#中文)
 
@@ -13,13 +13,14 @@ An Obsidian plugin that **disables Obsidian's native auto-conversion of typed sp
 
 ### What it does
 
-Obsidian, when "Indent using tabs" is enabled, may automatically convert leading spaces you type into Tab characters. This plugin intercepts the space key and inserts a plain space instead, so spaces always stay spaces.
+Obsidian (Markdown) treats a line starting with 4+ spaces or a tab as an "indented" structure, showing an indent guide and rendering it as an indented code block. This plugin inserts an invisible zero-width non-joiner (ZWNJ, `U+200C`) at the start of lines whose indentation is made of spaces. That breaks the Markdown indent rule while keeping the visible indentation.
 
 ### Features
 
-- **Toggle** in settings: "Disable auto space→Tab conversion" (on by default).
-- **Instant effect + persistence**: changes apply immediately without reloading, saved to `data.json`.
-- **No effect on existing content**: only affects spaces you type; existing text is never scanned or rewritten.
+- **Keeps spaces as spaces**: leading 4+ spaces no longer trigger indent guides or indented code blocks.
+- **Tab is untouched**: the Tab key's native indentation keeps working exactly as before.
+- **Toggle** in settings (on by default), applied immediately and saved to `data.json`.
+- **Smart exclusions**: list items, blockquotes, fenced code blocks, and YAML frontmatter are left alone.
 
 ### Installation
 
@@ -32,7 +33,7 @@ Obsidian, when "Indent using tabs" is enabled, may automatically convert leading
 
 ### Usage
 
-The plugin works out of the box. Type 4 spaces → they stay 4 spaces. To revert to Obsidian's default, open `Settings → Keep Spaces` and turn off the toggle.
+Works out of the box. Type 4 spaces at the start of a line → the text shifts right as plain spaces, no indent guide, no code block. Press Tab → normal indentation. Toggle off in `Settings → Keep Spaces` to revert.
 
 ### Build
 
@@ -51,13 +52,14 @@ npm run dev     # watch mode
 
 ### 它做什么
 
-Obsidian 在「使用制表符」开启时，可能把你输入的行首空格自动转换为 Tab。本插件拦截空格键，改为插入普通空格，让空格始终是空格。
+Obsidian（Markdown）会把「行首 4 个空格或 1 个 Tab」开头的行识别成缩进结构——显示缩进参考线，并渲染成缩进代码块。本插件在**由空格构成缩进**的行首插入一个不可见的零宽不连字符（ZWNJ，`U+200C`），打破这条 Markdown 规则，同时保留视觉上的缩进。
 
 ### 功能
 
-- **开关**：设置面板提供「屏蔽空格自动转 Tab」开关（默认开启）。
-- **即时生效 + 持久化**：修改后无需重载立即生效，并保存到 `data.json`。
-- **不影响已有内容**：只影响你正在输入的空格，绝不扫描或改写已有文本。
+- **空格保持空格**：行首 4+ 空格不再触发缩进参考线或缩进代码块。
+- **Tab 完全不受影响**：Tab 键的原生缩进功能原样保留。
+- **开关控制**（默认开启），修改后立即生效并保存到 `data.json`。
+- **智能排除**：列表项、引用、围栏代码块、YAML frontmatter 内的缩进不受影响。
 
 ### 安装
 
@@ -68,7 +70,7 @@ Obsidian 在「使用制表符」开启时，可能把你输入的行首空格�
 
 ### 使用
 
-装好即生效：输入 4 个空格，就还是 4 个空格。想恢复 Obsidian 原生行为，打开 `设置 → Keep Spaces` 关掉开关即可。
+装好即生效：行首输入 4 个空格 → 文字以普通空格右移，无缩进参考线、无代码块。按 Tab → 正常缩进。想恢复原样，打开 `设置 → Keep Spaces` 关掉开关即可。
 
 ### 构建
 
@@ -82,9 +84,13 @@ npm run dev     # 监听模式
 
 ## 实现要点 / Implementation Notes
 
-- 通过 `registerEditorExtension` 注册 CodeMirror 6 扩展，用**最高优先级**（`Prec.highest`）拦截空格：
-  - `keymap` 拦截 `Space` 键（keydown 阶段，最根因）；
-  - `EditorView.inputHandler` 拦截空格文本输入（input 阶段，兜底）。
-- 两个 handler 都在开关开启时手动插入一个普通空格并返回 `true`，从而阻止 Obsidian 后续的空格→Tab 转换。
-- 处理函数在**调用时**实时读取 `plugin.settings`，因此设置修改后立即生效。
-- 空格键在中文输入法组合（IME composition）期间不会被拦截，不影响正常输入。
+- 通过 `registerEditorExtension` 注册 CodeMirror 6 扩展，用 `EditorView.updateListener` 监听编辑变化：
+  - 检测「行首 4+ 空格」的行，在行首插入零宽字符（`U+200C`）打破缩进识别；
+  - 只匹配空格（`/^ {4}/`），**不匹配 Tab**，因此 Tab 键缩进完全保留。
+- 用 `Annotation` 标记插件自己产生的事务，避免死循环；检测到用户主动删除零宽字符（退格）时不重新插回。
+- 保留一层「事务纠正」兜底：若仍有「空格被转成 Tab 字符」的变化，立即换回空格。
+- 排除列表项（`-` / `*` / `1.`）、引用（`>`）、围栏代码块（```` ``` ```` / `~~~`）、YAML frontmatter。
+
+## 注意事项 / Caveat
+
+零宽字符方案会在文档中留下**不可见字符**（与社区 `Indent` 插件做法一致）。复制文本时会一并带上，一般无感知；若用其他工具严格处理文本时需留意。
