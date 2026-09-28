@@ -5,6 +5,7 @@ import {
   Compartment,
   EditorSelection,
   Prec,
+  Text,
   type Extension,
 } from "@codemirror/state";
 import { indentUnit } from "@codemirror/language";
@@ -24,6 +25,9 @@ const DEFAULT_SETTINGS: KeepSpacesSettings = {
   spacesPerTab: 4,
 };
 
+/** 零宽不连接符：插入在行首可打破 Markdown 的「缩进」识别，但视觉上不可见 */
+const ZWNJ = "\u200C";
+
 /** 用于标记本插件自己产生的更正事务，避免死循环 */
 const Correction = Annotation.define<boolean>();
 
@@ -40,12 +44,8 @@ export default class KeepSpacesPlugin extends Plugin {
   onunload() {}
 
   /**
-   * 生成覆盖 Obsidian 缩进单位的扩展。
-   *
-   * 原理：Obsidian 的整个缩进系统（Tab 键、智能缩进、以及把行首空格
-   * 「归一化」为缩进单位的行为）都依赖 CodeMirror 的 `indentUnit` facet，
-   * 而「使用制表符」开启时它的值是 "\t"。我们用最高优先级把它覆盖为
-   * 空格，就能从根源消除 Tab——空格永远保持空格。
+   * 覆盖 Obsidian 缩进单位：useTab 开启时它是 "\t"，这里用最高优先级
+   * 把它换成空格，使缩进系统不再产生 Tab 字符。
    */
   private buildIndentExtension(): Extension {
     const unit = this.settings.keepSpacesAsSpaces
@@ -57,12 +57,73 @@ export default class KeepSpacesPlugin extends Plugin {
   buildEditorExtension(): Extension {
     const plugin = this;
 
-    // 方案一：覆盖 indentUnit 为空格（从根源消除 Tab）
+    // 方案一：覆盖 indentUnit 为空格（消除 Tab 字符层面的转换）
     const indentOverride = this.indentCompartment.of(
       this.buildIndentExtension()
     );
 
-    // 方案二：事后纠正兜底——若仍有「空格被转成 Tab」的变化，立即换回空格
+    // 方案二：行首插入零宽字符（打破 Markdown 的「缩进」识别，
+    // 消除缩进参考线 / 缩进代码块等由 4 空格触发的结构化效果）
+    const zwnjApplier = EditorView.updateListener.of((update) => {
+      if (!plugin.settings.keepSpacesAsSpaces) {
+        return;
+      }
+      // 跳过本插件自己的事务，避免死循环
+      if (update.transactions.some((tr) => tr.annotation(Correction))) {
+        return;
+      }
+
+      // 若用户主动删除了 ZWNJ（退格），本次不再插回，尊重用户操作
+      let zwnjDeleted = false;
+      const touchedLines = new Set<number>();
+      for (const tr of update.transactions) {
+        if (!tr.docChanged) {
+          continue;
+        }
+        tr.changes.iterChanges((fromA, toA, _f, _t) => {
+          const del = tr.startState.doc.sliceString(fromA, toA);
+          if (del.includes(ZWNJ)) {
+            zwnjDeleted = true;
+          }
+        });
+        tr.changes.iterChangedRanges((_a, _b, fromB, toB) => {
+          const start = update.state.doc.lineAt(fromB).number;
+          const end = update.state.doc.lineAt(toB).number;
+          for (let n = start; n <= end; n++) {
+            touchedLines.add(n);
+          }
+        });
+      }
+      if (zwnjDeleted) {
+        return;
+      }
+
+      // 对受影响的行逐一检测：行首是 4+ 空格 / Tab 且不属于合法缩进场景时，
+      // 在行首插入 ZWNJ
+      const doc = update.state.doc;
+      const insertions: number[] = [];
+      for (const lineNumber of touchedLines) {
+        if (lineNumber < 1 || lineNumber > doc.lines) {
+          continue;
+        }
+        const line = doc.line(lineNumber);
+        if (lineNeedsZWNJ(doc, lineNumber, line.text)) {
+          insertions.push(line.from);
+        }
+      }
+
+      if (insertions.length > 0) {
+        const view = update.view;
+        setTimeout(() => {
+          view.dispatch({
+            changes: insertions.map((from) => ({ from, insert: ZWNJ })),
+            annotations: Correction.of(true),
+          });
+        }, 0);
+      }
+    });
+
+    // 方案三：事后纠正兜底——若仍有「空格被转成 Tab」的变化，立即换回空格
     const corrector = EditorView.updateListener.of((update) => {
       if (!plugin.settings.keepSpacesAsSpaces) {
         return;
@@ -83,7 +144,6 @@ export default class KeepSpacesPlugin extends Plugin {
           }
           const ins = inserted.toString();
           const del = tr.startState.doc.sliceString(fromA, toA);
-          // 判定：删除了「含空格的纯空白」，插入了「含 Tab 的纯空白」
           if (
             /^[ \t]*$/.test(del) &&
             /^[ \t]*$/.test(ins) &&
@@ -112,7 +172,7 @@ export default class KeepSpacesPlugin extends Plugin {
       }
     });
 
-    return [indentOverride, corrector];
+    return [indentOverride, zwnjApplier, corrector];
   }
 
   /**
@@ -141,6 +201,69 @@ export default class KeepSpacesPlugin extends Plugin {
 }
 
 /**
+ * 判断某行是否需要在行首插入 ZWNJ。
+ * 条件：行首是 Tab 或 4+ 空格、尚未有 ZWNJ、
+ *       且不属于「缩进合法」的场景（列表、引用、围栏代码块、YAML）。
+ */
+function lineNeedsZWNJ(
+  doc: Text,
+  lineNumber: number,
+  lineText: string
+): boolean {
+  if (lineText.startsWith(ZWNJ)) {
+    return false;
+  }
+  if (!/^(\t| {4})/.test(lineText)) {
+    return false;
+  }
+  // 去掉缩进后是列表项 / 任务 / 引用 → 属于合法缩进，不处理
+  const trimmed = lineText.replace(/^[ \t]+/, "");
+  if (/^([-*+]|\d+[.)])\s/.test(trimmed) || /^>/.test(trimmed)) {
+    return false;
+  }
+  // 围栏代码块 / YAML frontmatter 内不处理
+  if (isInsideFencedCode(doc, lineNumber)) {
+    return false;
+  }
+  if (isInsideYamlFrontmatter(doc, lineNumber)) {
+    return false;
+  }
+  return true;
+}
+
+/** 判断某行是否位于 ``` / ~~~ 围栏代码块内部 */
+function isInsideFencedCode(doc: Text, targetLine: number): boolean {
+  let inFence = false;
+  let marker = "";
+  for (let i = 1; i <= targetLine; i++) {
+    const text = doc.line(i).text;
+    const m = text.match(/^\s*(`{3,}|~{3,})/);
+    if (m) {
+      if (!inFence) {
+        inFence = true;
+        marker = m[1][0];
+      } else if (text.trimStart().startsWith(marker)) {
+        inFence = false;
+      }
+    }
+  }
+  return inFence;
+}
+
+/** 判断某行是否位于 YAML frontmatter（文档开头的 --- 区间）内 */
+function isInsideYamlFrontmatter(doc: Text, targetLine: number): boolean {
+  if (doc.lines < 2 || doc.line(1).text.trim() !== "---") {
+    return false;
+  }
+  for (let i = 2; i <= doc.lines; i++) {
+    if (doc.line(i).text.trim() === "---") {
+      return targetLine > 1 && targetLine < i;
+    }
+  }
+  return false;
+}
+
+/**
  * 设置面板。
  */
 class KeepSpacesSettingTab extends PluginSettingTab {
@@ -158,9 +281,10 @@ class KeepSpacesSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Keep Spaces（空格保持空格）" });
 
     new Setting(containerEl)
-      .setName("屏蔽「空格转 Tab」")
+      .setName("屏蔽「空格转 Tab / 缩进」")
       .setDesc(
-        "开启后，缩进统一使用空格：输入的空格保持为空格，不会被 Obsidian 当作 Tab 缩进。修改后立即生效并自动保存。"
+        "开启后：输入的空格保持为普通空格——不会被转成 Tab，也不会触发" +
+          "缩进参考线、缩进代码块等结构化效果。列表、代码块、引用中的缩进不受影响。"
       )
       .addToggle((toggle) =>
         toggle

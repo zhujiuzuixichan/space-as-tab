@@ -1,7 +1,7 @@
 {
   "id": "space-as-tab",
   "name": "Keep Spaces",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "minAppVersion": "1.0.0",
   "description": "Disable Obsidian's native behavior of auto-converting typed spaces to Tab, so spaces stay spaces. 屏蔽 Obsidian 原生「输入空格自动转 Tab」的行为，让空格保持为空格。",
   "author": "Mu",
