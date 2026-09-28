@@ -1,6 +1,6 @@
 {
   "name": "space-as-tab",
-  "version": "1.2.0",
+  "version": "1.3.0",
   "description": "Obsidian plugin: disable auto-converting typed spaces to Tab, so spaces stay spaces. 屏蔽「输入空格自动转 Tab」，让空格保持空格。",
   "main": "main.js",
   "scripts": {
@@ -21,6 +21,7 @@
     "url": "https://github.com/zhujiuzuixichan/space-as-tab.git"
   },
   "devDependencies": {
+    "@codemirror/language": "^6.10.3",
     "@codemirror/state": "6.5.0",
     "@codemirror/view": "6.38.6",
     "@types/node": "^16.11.6",

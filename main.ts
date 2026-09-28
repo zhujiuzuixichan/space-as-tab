@@ -2,15 +2,17 @@ import { App, Plugin, PluginSettingTab, Setting } from "obsidian";
 import { EditorView } from "@codemirror/view";
 import {
   Annotation,
+  Compartment,
   EditorSelection,
   Prec,
   type Extension,
 } from "@codemirror/state";
+import { indentUnit } from "@codemirror/language";
 
 /**
  * 插件设置结构。
- * - keepSpacesAsSpaces：是否屏蔽 Obsidian 原生「输入空格自动转 Tab」
- * - spacesPerTab：纠正时 1 个 Tab 等价于多少个空格（默认 4）
+ * - keepSpacesAsSpaces：是否屏蔽 Obsidian 原生「空格等价于 Tab 缩进」的行为
+ * - spacesPerTab：1 个 Tab 等价于多少个空格（默认 4）
  */
 interface KeepSpacesSettings {
   keepSpacesAsSpaces: boolean;
@@ -22,11 +24,12 @@ const DEFAULT_SETTINGS: KeepSpacesSettings = {
   spacesPerTab: 4,
 };
 
-/** 用于标记本插件自己产生的更正事务，避免纠正逻辑进入死循环 */
+/** 用于标记本插件自己产生的更正事务，避免死循环 */
 const Correction = Annotation.define<boolean>();
 
 export default class KeepSpacesPlugin extends Plugin {
   settings: KeepSpacesSettings;
+  private indentCompartment = new Compartment();
 
   async onload() {
     await this.loadSettings();
@@ -37,42 +40,33 @@ export default class KeepSpacesPlugin extends Plugin {
   onunload() {}
 
   /**
-   * 构建编辑器扩展。采用「拦截 + 事后纠正」双保险：
+   * 生成覆盖 Obsidian 缩进单位的扩展。
    *
-   * 1) inputHandler 抢占式拦截空格输入（若优先级足够，则直接插入普通空格，
-   *    从源头阻断 Obsidian 的空格→Tab 转换）。
-   * 2) updateListener 事后纠正（兜底）：Obsidian 的转换即使发生在更底层，
-   *    最终都会反映为「文档中的空格变成了 Tab」，我们检测到这种变化后，
-   *    立即把 Tab 换回等量的空格。
+   * 原理：Obsidian 的整个缩进系统（Tab 键、智能缩进、以及把行首空格
+   * 「归一化」为缩进单位的行为）都依赖 CodeMirror 的 `indentUnit` facet，
+   * 而「使用制表符」开启时它的值是 "\t"。我们用最高优先级把它覆盖为
+   * 空格，就能从根源消除 Tab——空格永远保持空格。
    */
+  private buildIndentExtension(): Extension {
+    const unit = this.settings.keepSpacesAsSpaces
+      ? " ".repeat(Math.max(1, this.settings.spacesPerTab))
+      : "\t";
+    return Prec.highest(indentUnit.of(unit));
+  }
+
   buildEditorExtension(): Extension {
     const plugin = this;
 
-    // 拦截空格文本输入（input 阶段）
-    const spaceInputHandler = Prec.highest(
-      EditorView.inputHandler.of((view, from, to, text) => {
-        if (!plugin.settings.keepSpacesAsSpaces) {
-          return false;
-        }
-        if (text !== " " || from !== to) {
-          return false;
-        }
-        view.dispatch({
-          changes: { from, to, insert: " " },
-          selection: EditorSelection.cursor(from + 1),
-          userEvent: "input.type",
-          annotations: Correction.of(true),
-        });
-        return true;
-      })
+    // 方案一：覆盖 indentUnit 为空格（从根源消除 Tab）
+    const indentOverride = this.indentCompartment.of(
+      this.buildIndentExtension()
     );
 
-    // 事后纠正：检测「空格被转成 Tab」的变化，换回空格
+    // 方案二：事后纠正兜底——若仍有「空格被转成 Tab」的变化，立即换回空格
     const corrector = EditorView.updateListener.of((update) => {
       if (!plugin.settings.keepSpacesAsSpaces) {
         return;
       }
-      // 跳过本插件自己产生的事务，避免死循环
       if (update.transactions.some((tr) => tr.annotation(Correction))) {
         return;
       }
@@ -89,15 +83,13 @@ export default class KeepSpacesPlugin extends Plugin {
           }
           const ins = inserted.toString();
           const del = tr.startState.doc.sliceString(fromA, toA);
-          // 关键判定：删除了「含空格的纯空白」，插入了「含 Tab 的纯空白」
-          // —— 这正是 Obsidian 把输入的空格转换成 Tab 的特征。
+          // 判定：删除了「含空格的纯空白」，插入了「含 Tab 的纯空白」
           if (
             /^[ \t]*$/.test(del) &&
             /^[ \t]*$/.test(ins) &&
             del.includes(" ") &&
             ins.includes("\t")
           ) {
-            // 把插入的 Tab 换算回等量空格（1 个 Tab = spacesPerTab 个空格）
             const tabCount = (ins.match(/\t/g) || []).length;
             const spaceCount = (ins.match(/ /g) || []).length;
             const spaces = " ".repeat(
@@ -111,7 +103,6 @@ export default class KeepSpacesPlugin extends Plugin {
       if (fix) {
         const view = update.view;
         const { from, to, insert } = fix;
-        // 延迟到当前事务结束之后执行，避免在 update 回调内再触发 dispatch
         setTimeout(() => {
           view.dispatch({
             changes: { from, to, insert },
@@ -121,7 +112,23 @@ export default class KeepSpacesPlugin extends Plugin {
       }
     });
 
-    return [spaceInputHandler, corrector];
+    return [indentOverride, corrector];
+  }
+
+  /**
+   * 设置变化后，把新的缩进单位应用到所有已打开的编辑器。
+   */
+  refreshIndentUnit() {
+    const effect = this.indentCompartment.reconfigure(
+      this.buildIndentExtension()
+    );
+    this.app.workspace.iterateAllLeaves((leaf) => {
+      const anyView = leaf.view as { editor?: { cm?: EditorView } } | null;
+      const cm = anyView?.editor?.cm;
+      if (cm) {
+        cm.dispatch({ effects: effect });
+      }
+    });
   }
 
   async loadSettings() {
@@ -151,9 +158,9 @@ class KeepSpacesSettingTab extends PluginSettingTab {
     containerEl.createEl("h2", { text: "Keep Spaces（空格保持空格）" });
 
     new Setting(containerEl)
-      .setName("屏蔽「空格自动转 Tab」")
+      .setName("屏蔽「空格转 Tab」")
       .setDesc(
-        "开启后，输入的空格保持为普通空格，不会被 Obsidian 自动转换为 Tab。修改后立即生效并自动保存。"
+        "开启后，缩进统一使用空格：输入的空格保持为空格，不会被 Obsidian 当作 Tab 缩进。修改后立即生效并自动保存。"
       )
       .addToggle((toggle) =>
         toggle
@@ -161,12 +168,13 @@ class KeepSpacesSettingTab extends PluginSettingTab {
           .onChange(async (value) => {
             this.plugin.settings.keepSpacesAsSpaces = value;
             await this.plugin.saveSettings();
+            this.plugin.refreshIndentUnit();
           })
       );
 
     new Setting(containerEl)
       .setName("一个 Tab 对应的空格数")
-      .setDesc("纠正缩进时，1 个 Tab 换算成多少个空格（默认 4）。")
+      .setDesc("缩进单位宽度（默认 4）。")
       .addText((text) =>
         text
           .setValue(String(this.plugin.settings.spacesPerTab))
@@ -175,6 +183,7 @@ class KeepSpacesSettingTab extends PluginSettingTab {
             if (!Number.isNaN(parsed) && parsed >= 1) {
               this.plugin.settings.spacesPerTab = parsed;
               await this.plugin.saveSettings();
+              this.plugin.refreshIndentUnit();
             }
           })
       );
